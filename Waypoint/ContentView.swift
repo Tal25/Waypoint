@@ -204,13 +204,10 @@ struct ContentView: View {
     // MARK: - Helpers
 
     private var formattedDistance: String {
-        let feet = vm.distanceMetres * 3.28084
-        guard feet > 0 else { return "---" }
-        if feet >= 1000 {
-            let miles = feet / 5280
-            return String(format: "%.1f mi", miles)
-        }
-        return String(format: "%.0f ft", feet)
+        guard vm.distanceMetres > 0 else { return "---" }
+        // Always whole feet — no decimals, no miles, updates every 1 ft change
+        let feet = Int((vm.distanceMetres * 3.28084).rounded())
+        return "\(feet) ft"
     }
 
     private var gpsLabel: String {
@@ -390,7 +387,9 @@ struct GPSPill: View {
     }
 
     private var label: String {
-        accuracy < 0 ? "No GPS" : String(format: "±%.0f m", accuracy)
+        guard accuracy >= 0 else { return "No GPS" }
+        let feet = Int((accuracy * 3.28084).rounded())
+        return "±\(feet) ft"
     }
 }
 

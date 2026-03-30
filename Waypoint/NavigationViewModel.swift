@@ -187,24 +187,15 @@ class NavigationViewModel: NSObject, ObservableObject {
     // MARK: - Formatting
 
     private func formatDistance(_ metres: Double) -> String {
-        let feet = metres * 3.28084
-        if feet >= 1000 {
-            return String(format: "%.1f mi", feet / 5280)
-        }
-        return String(format: "%.0f ft", feet)
+        // Always whole feet — internal calculations stay in metres
+        let feet = Int((metres * 3.28084).rounded())
+        return "\(feet) ft"
     }
 
     private func formatDistanceSpeech(_ metres: Double) -> String {
-        let feet = metres * 3.28084
-        if feet >= 5280 {
-            let miles = feet / 5280
-            return String(format: "%.1f miles remaining", miles)
-        }
-        if feet >= 1000 {
-            let miles = feet / 5280
-            return String(format: "%.2f miles remaining", miles)
-        }
-        return "\(Int(feet)) feet remaining"
+        // Spoken as whole feet at every milestone
+        let feet = Int((metres * 3.28084).rounded())
+        return "\(feet) feet remaining"
     }
 
     // MARK: - Geometry helpers

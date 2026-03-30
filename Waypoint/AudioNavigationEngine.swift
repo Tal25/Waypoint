@@ -1,32 +1,69 @@
 import AVFoundation
 import Combine
 
+// MARK: - AudioNavigationEngine
+
 class AudioNavigationEngine: NSObject, ObservableObject {
 
-    // MARK: - Published
-    @Published var isPanning: Float = 0  // -1 to 1, for the sighted-companion visualiser
+    // MARK: - Published (read by ContentView for the pan visualiser)
+    @Published var isPanning: Float = 0
 
-    // MARK: - Audio Engine
+    // MARK: - Audio engine
     private let audioEngine = AVAudioEngine()
-    private let environmentNode = AVAudioEnvironmentNode()
     private var sourceNode: AVAudioSourceNode?
 
-    // MARK: - Tone state (written on main, read on audio thread — atomic-style via DispatchQueue)
-    private var currentFrequency: Float = 392.0
-    private var currentAmplitude: Float = 0.0
-    private var phase: Float = 0.0
-    private var sampleRate: Float = 44100.0
+    // ─────────────────────────────────────────────────────────────────────────
+    // Render-thread state
+    //
+    // These variables are written from the main/pulse queue and read from the
+    // real-time audio render callback. On ARM64 (all modern iPhones), 32-bit
+    // and 64-bit aligned reads/writes are naturally atomic, which is the
+    // accepted pattern for lock-free audio programming on iOS.
+    // ─────────────────────────────────────────────────────────────────────────
 
-    // MARK: - Pulse state
-    private var pulseTimer: Timer?
+    // Oscillator
+    private var phase: Float = 0
+    private var currentFrequency: Float = 330
+    private var targetFrequency:  Float = 330
+
+    // Stereo pan  (−1 = hard left, 0 = centre, +1 = hard right)
+    private var currentPan: Float = 0
+    private var targetPan:  Float = 0
+
+    // Gain / envelope
+    private var currentGain: Float = 0.001
+
+    // Envelope state machine  (Int32 for ARM64 atomicity)
+    //   0 = silence  1 = attack  2 = decay  3 = continuous
+    private var envelopeState: Int32 = 0
+
+    // Per-frame counters (read+written exclusively on audio thread)
+    private var attackFrame: Int32 = 0
+    private var decaySamplesLeft: Int32 = 0
+
+    // Blip trigger: pulse queue writes 1, render block clears to 0
+    private var blipTrigger: Int32 = 0
+
+    // Precomputed envelope constants (set once in buildAudioGraph)
+    private var sampleRate: Float = 44100
+    private var attackSamples: Int32 = 1764    // 40 ms @ 44100
+    private var decaySamples:  Int32 = 7938    // 180 ms @ 44100
+    private var decayMult:     Float = 1.0     // per-sample exponential factor
+    private var freqAlpha:     Float = 0.0     // per-frame smoothing, 0.1 s ramp
+    private var panAlpha:      Float = 0.0     // per-frame smoothing, 0.08 s ramp
+
+    // MARK: - Pulse queue
+    private let pulseQueue = DispatchQueue(label: "audio.pulse", qos: .userInteractive)
     private var pulseInterval: TimeInterval = 2.0
+    private var isRunning    = false
     private var isContinuous = false
-    private var isRunning = false
 
     // MARK: - Speech
     private let speech = AVSpeechSynthesizer()
 
+    // ─────────────────────────────────────────────────────────────────────────
     // MARK: - Setup
+    // ─────────────────────────────────────────────────────────────────────────
 
     func setup() {
         configureAudioSession()
@@ -36,7 +73,6 @@ class AudioNavigationEngine: NSObject, ObservableObject {
     private func configureAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            // .playback keeps audio going with screen off; mixWithOthers allows ambient sounds
             try session.setCategory(.playback, mode: .default,
                                     options: [.mixWithOthers, .allowBluetooth, .allowBluetoothA2DP])
             try session.setActive(true)
@@ -46,45 +82,106 @@ class AudioNavigationEngine: NSObject, ObservableObject {
     }
 
     private func buildAudioGraph() {
-        // Determine sample rate from hardware
         let hwRate = audioEngine.outputNode.outputFormat(forBus: 0).sampleRate
         sampleRate = hwRate > 0 ? Float(hwRate) : 44100
 
-        let monoFormat = AVAudioFormat(standardFormatWithSampleRate: Double(sampleRate), channels: 1)!
-        let stereoFormat = AVAudioFormat(standardFormatWithSampleRate: Double(sampleRate), channels: 2)!
+        // Envelope timing
+        attackSamples  = Int32(sampleRate * 0.040)  // 40 ms linear attack
+        decaySamples   = Int32(sampleRate * 0.180)  // 180 ms exponential decay
+        // Factor: 0.28 → 0.001 over decaySamples frames
+        decayMult = powf(0.001 / 0.28, 1.0 / Float(decaySamples))
 
-        // HRTF environment node — true 3-D head-related transfer function
-        environmentNode.renderingAlgorithm = .HRTF
-        environmentNode.reverbParameters.enable = false
-        environmentNode.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: 0)
-        environmentNode.listenerAngularOrientation = AVAudio3DAngularOrientation(yaw: 0, pitch: 0, roll: 0)
+        // Per-frame smoothing alphas (exponential approach)
+        freqAlpha = 1.0 - expf(-1.0 / (0.10 * sampleRate))  // 0.1 s frequency ramp
+        panAlpha  = 1.0 - expf(-1.0 / (0.08 * sampleRate))  // 0.08 s pan ramp
 
-        // AVAudioSourceNode renders our sine wave on the real-time audio thread
-        let sr = sampleRate
-        sourceNode = AVAudioSourceNode(format: monoFormat) { [weak self] _, _, frameCount, audioBufferList in
+        // Capture immutables for the render closure
+        let sr          = sampleRate
+        let fa          = freqAlpha
+        let pa          = panAlpha
+        let aSamples    = attackSamples
+        let dm          = decayMult
+
+        let stereoFormat = AVAudioFormat(standardFormatWithSampleRate: Double(sr), channels: 2)!
+
+        sourceNode = AVAudioSourceNode(format: stereoFormat) { [weak self] _, _, frameCount, audioBufferList in
             guard let self = self else { return noErr }
-            let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
-            let twoPi: Float = .pi * 2
-            let phaseIncrement = twoPi * self.currentFrequency / sr
 
-            for frame in 0 ..< Int(frameCount) {
-                let sample = sinf(self.phase) * self.currentAmplitude
-                self.phase += phaseIncrement
-                if self.phase >= twoPi { self.phase -= twoPi }
-                for buffer in ablPointer {
-                    buffer.mData?.assumingMemoryBound(to: Float.self)[frame] = sample
+            let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            guard abl.count >= 2,
+                  let leftBuf  = abl[0].mData?.assumingMemoryBound(to: Float.self),
+                  let rightBuf = abl[1].mData?.assumingMemoryBound(to: Float.self)
+            else { return noErr }
+
+            let twoPi: Float = .pi * 2
+
+            // Pick up any blip trigger queued by the pulse queue
+            if self.blipTrigger == 1 {
+                self.blipTrigger   = 0
+                self.attackFrame   = 0
+                self.envelopeState = 1   // attack
+            }
+
+            for i in 0 ..< Int(frameCount) {
+
+                // ── Smooth frequency (0.1 s ramp) ──────────────────────────
+                self.currentFrequency += (self.targetFrequency - self.currentFrequency) * fa
+
+                // ── Smooth pan (0.08 s ramp) ────────────────────────────────
+                self.currentPan += (self.targetPan - self.currentPan) * pa
+
+                // ── Envelope state machine ──────────────────────────────────
+                switch self.envelopeState {
+
+                case 0: // silence
+                    self.currentGain = 0.001
+
+                case 1: // attack — linear ramp 0.001 → 0.28 over attackSamples
+                    self.attackFrame += 1
+                    let t = Float(self.attackFrame) / Float(aSamples)
+                    self.currentGain = 0.001 + (0.28 - 0.001) * min(t, 1.0)
+                    if self.attackFrame >= aSamples {
+                        self.currentGain       = 0.28
+                        self.decaySamplesLeft  = self.decaySamples
+                        self.envelopeState     = 2   // → decay
+                    }
+
+                case 2: // decay — exponential 0.28 → 0.001 over decaySamples
+                    self.currentGain *= dm
+                    self.decaySamplesLeft -= 1
+                    if self.decaySamplesLeft <= 0 {
+                        self.currentGain   = 0.001
+                        self.envelopeState = 0   // → silence
+                    }
+
+                case 3: // continuous — smooth approach to 0.25
+                    self.currentGain += (0.25 - self.currentGain) * 0.003
+
+                default:
+                    self.currentGain = 0.001
                 }
+
+                // ── Generate sine sample ────────────────────────────────────
+                let sample = sinf(self.phase)
+                self.phase += twoPi * self.currentFrequency / sr
+                if self.phase >= twoPi { self.phase -= twoPi }
+
+                // ── Stereo pan (balance law from spec) ──────────────────────
+                //   leftVolume  = 1 − max(0, pan)
+                //   rightVolume = 1 + min(0, pan)
+                let p = self.currentPan
+                let leftVol  = 1.0 - max(0, p)
+                let rightVol = 1.0 + min(0, p)
+
+                leftBuf[i]  = sample * self.currentGain * leftVol
+                rightBuf[i] = sample * self.currentGain * rightVol
             }
             return noErr
         }
 
         guard let source = sourceNode else { return }
-
-        audioEngine.attach(environmentNode)
         audioEngine.attach(source)
-        // source -> HRTF environment -> main mixer -> output
-        audioEngine.connect(source, to: environmentNode, format: monoFormat)
-        audioEngine.connect(environmentNode, to: audioEngine.mainMixerNode, format: stereoFormat)
+        audioEngine.connect(source, to: audioEngine.mainMixerNode, format: stereoFormat)
 
         do {
             try audioEngine.start()
@@ -93,131 +190,139 @@ class AudioNavigationEngine: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Navigation Control
+    // ─────────────────────────────────────────────────────────────────────────
+    // MARK: - Navigation control
+    // ─────────────────────────────────────────────────────────────────────────
 
     func startNavigation() {
-        isRunning = true
-        currentAmplitude = 0
+        isRunning    = true
         isContinuous = false
-        startPulseCycle()
-        speak("Navigation started. The tone will guide you to your destination.")
+        currentGain  = 0.001
+        envelopeState = 0      // silence
+        schedulePulse(after: 0.05)
+        speak("Navigation started.")
     }
 
     func stopNavigation() {
-        isRunning = false
-        stopPulseCycle()
-        currentAmplitude = 0
+        isRunning     = false
+        isContinuous  = false
+        envelopeState = 0      // silence immediately (80 ms fade handled by smoothing)
         speak("Navigation stopped.")
     }
 
-    // MARK: - Live Update
+    // ─────────────────────────────────────────────────────────────────────────
+    // MARK: - Live update
+    //
+    // Called by NavigationViewModel on every location and heading change.
+    // No throttling. All distance values stay in metres internally.
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// Call on every location or heading change.
-    /// - distanceMetres: total path distance remaining
-    /// - relativeBearingDegrees: bearing to next waypoint minus user heading (0 = straight ahead)
     func update(distanceMetres: Double, relativeBearingDegrees: Double) {
         guard isRunning else { return }
-        updateFrequency(distance: distanceMetres)
-        updatePulseRate(distance: distanceMetres)
-        update3DPosition(relativeBearing: relativeBearingDegrees)
 
-        let radians = Float(relativeBearingDegrees) * .pi / 180
-        DispatchQueue.main.async { self.isPanning = sinf(radians) }
-    }
+        // ── Frequency: 330 Hz @ 500 m+, 880 Hz @ 0 m ──────────────────────
+        let clamped = max(0.0, min(distanceMetres, 500.0))
+        targetFrequency = Float(330.0 + ((500.0 - clamped) / 500.0) * 550.0)
 
-    private func updateFrequency(distance: Double) {
-        // Linear interpolation: 392 Hz (G4) at 500 m+, 880 Hz (A5) at 0 m
-        let clamped = max(0, min(distance, 500))
-        let t = Float(1.0 - clamped / 500.0)
-        currentFrequency = 392.0 + (880.0 - 392.0) * t
-    }
+        // ── Pan ────────────────────────────────────────────────────────────
+        // relativeBearingDegrees is 0–360 (0 = straight ahead).
+        // Normalise to −180…+180 then scale: pan = clamp(diff/80, −1, +1)
+        var diff = relativeBearingDegrees
+        if diff > 180 { diff -= 360 }
+        let pan = Float(max(-1.0, min(1.0, diff / 80.0)))
+        targetPan = pan
+        DispatchQueue.main.async { self.isPanning = pan }
 
-    private func updatePulseRate(distance: Double) {
-        if distance <= 5 {
-            // Continuous tone within 5 m
-            guard !isContinuous else { return }
-            isContinuous = true
-            pulseTimer?.invalidate()
-            currentAmplitude = 0.4
-        } else {
-            isContinuous = false
-            // Pulse interval: 2 s far, 0.3 s near (5 m boundary)
-            let clamped = max(5.0, min(distance, 500.0))
-            let t = (clamped - 5.0) / (500.0 - 5.0)
-            pulseInterval = 0.3 + (2.0 - 0.3) * t
+        // ── Pulse interval ─────────────────────────────────────────────────
+        let newInterval   = intervalForDistance(distanceMetres)
+        let nowContinuous = distanceMetres < 3.0
+
+        if nowContinuous != isContinuous {
+            isContinuous  = nowContinuous
+            envelopeState = nowContinuous ? 3 : 0   // continuous or silence
+        }
+
+        if !nowContinuous, abs(newInterval - pulseInterval) > 0.1 {
+            pulseInterval = newInterval
         }
     }
 
-    // MARK: - Pulse Engine
-
-    private func startPulseCycle() {
-        pulseTimer?.invalidate()
-        guard !isContinuous else { return }
-        schedulePulse()
+    private func intervalForDistance(_ d: Double) -> TimeInterval {
+        switch d {
+        case ..<3:    return 0.250  // continuous — not used directly
+        case 3..<6:   return 0.250
+        case 6..<10:  return 0.500
+        case 10..<15: return 0.900
+        case 15..<20: return 1.400
+        default:      return 2.000
+        }
     }
 
-    private func stopPulseCycle() {
-        pulseTimer?.invalidate()
-        currentAmplitude = 0
-    }
+    // ─────────────────────────────────────────────────────────────────────────
+    // MARK: - Pulse scheduling (serial recursive DispatchQueue.asyncAfter)
+    // ─────────────────────────────────────────────────────────────────────────
 
-    private func schedulePulse() {
+    private func schedulePulse(after delay: TimeInterval) {
         guard isRunning, !isContinuous else { return }
-        pulseTimer = Timer.scheduledTimer(withTimeInterval: pulseInterval, repeats: false) { [weak self] _ in
-            self?.firePulse()
+        pulseQueue.asyncAfter(deadline: .now() + max(delay, 0.02)) { [weak self] in
+            guard let self = self, self.isRunning, !self.isContinuous else { return }
+            // Signal render block to start blip
+            self.blipTrigger = 1
+            // Recurse: schedule next pulse after current interval
+            self.schedulePulse(after: self.pulseInterval)
         }
     }
 
-    private func firePulse() {
-        currentAmplitude = 0.4
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self = self, !self.isContinuous, self.isRunning else { return }
-            self.currentAmplitude = 0
-            self.schedulePulse()
-        }
-    }
-
-    // MARK: - 3-D Positioning
-
-    private func update3DPosition(relativeBearing: Double) {
-        // Bearing 0° → straight ahead (negative Z in AVAudioEnvironmentNode space)
-        // Bearing 90° → right (positive X)
-        let rad = relativeBearing * .pi / 180
-        let x = Float(sin(rad))
-        let z = Float(-cos(rad))           // forward = -Z
-        sourceNode?.position = AVAudio3DPoint(x: x, y: 0, z: z)
-    }
-
-    // MARK: - Arrival Chime
+    // ─────────────────────────────────────────────────────────────────────────
+    // MARK: - Arrival chime
+    //
+    // Three sequential tones: 440 Hz, 523 Hz, 659 Hz
+    // Each: 40 ms attack (uses blip envelope), held for 550 ms, then silence.
+    // ─────────────────────────────────────────────────────────────────────────
 
     func playArrivalChime() {
-        stopNavigation()
-        // Ascending triad: A4 (440), C5 (523.25), E5 (659.25)
-        playChimeNote(frequency: 440.00, after: 0.0)
-        playChimeNote(frequency: 523.25, after: 0.35)
-        playChimeNote(frequency: 659.25, after: 0.70)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) {
-            self.speak("You have arrived at your destination.")
-        }
-    }
+        isRunning     = false
+        isContinuous  = false
+        envelopeState = 0
 
-    private func playChimeNote(frequency: Float, after delay: TimeInterval) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self = self else { return }
-            self.currentFrequency = frequency
-            self.currentAmplitude = 0.5
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
-                self.currentAmplitude = 0
+        let notes: [(Float, TimeInterval)] = [
+            (440, 0.000),
+            (523, 0.350),
+            (659, 0.700)
+        ]
+
+        for (freq, t) in notes {
+            // Start note
+            pulseQueue.asyncAfter(deadline: .now() + t) { [weak self] in
+                guard let self = self else { return }
+                // Snap to frequency immediately (no ramp for chime)
+                self.currentFrequency = freq
+                self.targetFrequency  = freq
+                self.attackFrame      = 0
+                self.envelopeState    = 1   // attack
+            }
+            // End note after 550 ms
+            pulseQueue.asyncAfter(deadline: .now() + t + 0.55) { [weak self] in
+                self?.envelopeState = 0
+            }
+        }
+
+        // Speak after chime finishes
+        pulseQueue.asyncAfter(deadline: .now() + 1.5) {
+            DispatchQueue.main.async { [weak self] in
+                self?.speak("You have arrived.")
             }
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
     // MARK: - Speech
+    // ─────────────────────────────────────────────────────────────────────────
 
     func speak(_ text: String) {
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-        utterance.rate = 0.52
+        utterance.rate  = 0.52
         utterance.pitchMultiplier = 1.0
         speech.stopSpeaking(at: .word)
         speech.speak(utterance)
