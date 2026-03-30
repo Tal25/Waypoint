@@ -11,7 +11,9 @@ class NavigationViewModel: NSObject, ObservableObject {
     @Published var isNavigating = false
     @Published var hasLocationPermission = false
     @Published var statusMessage = "Tap Start to begin navigation"
-    @Published var isGPSReady = false  // true when accuracy ≤ 20 m
+    @Published var isGPSReady = false        // true when accuracy ≤ 20 m
+    @Published var compassHeading: Double = 0 // device heading in degrees from north
+    @Published var relativeBearing: Double = 0 // bearing to destination relative to user
 
     // MARK: - Audio engine (shared with ContentView)
     let audio = AudioNavigationEngine()
@@ -38,7 +40,7 @@ class NavigationViewModel: NSObject, ObservableObject {
         super.init()
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
-        locationManager.distanceFilter = 2          // update every 2 m
+        locationManager.distanceFilter = 1           // update every 1 m for smooth real-time display
         locationManager.headingFilter = 3            // update every 3 degrees
         locationManager.allowsBackgroundLocationUpdates = true
         locationManager.pausesLocationUpdatesAutomatically = false
@@ -141,12 +143,13 @@ class NavigationViewModel: NSObject, ObservableObject {
 
         let totalDist = totalRemainingDistance(from: userLoc.coordinate)
         distanceMetres = totalDist
-        statusMessage = formattedDistance(totalDist) + " to destination"
+        statusMessage = formatDistance(totalDist) + " to destination"
 
         let bearing = bearingFrom(userLoc.coordinate, to: currentTarget())
-        let relativeBearing = (bearing - userHeading + 360).truncatingRemainder(dividingBy: 360)
+        let rel = (bearing - userHeading + 360).truncatingRemainder(dividingBy: 360)
+        relativeBearing = rel
 
-        audio.update(distanceMetres: totalDist, relativeBearingDegrees: relativeBearing)
+        audio.update(distanceMetres: totalDist, relativeBearingDegrees: rel)
 
         if totalDist < 5 {
             isNavigating = false
@@ -176,20 +179,32 @@ class NavigationViewModel: NSObject, ObservableObject {
             let key = Int(milestone)
             if distance <= milestone, !announcedMilestones.contains(key) {
                 announcedMilestones.insert(key)
-                let text = milestone >= 1000
-                    ? "\(Int(milestone / 1000)) kilometre remaining"
-                    : "\(Int(milestone)) metres remaining"
-                audio.speak(text)
+                audio.speak(formatDistanceSpeech(milestone))
             }
         }
     }
 
     // MARK: - Formatting
 
-    private func formattedDistance(_ metres: Double) -> String {
-        metres >= 1000
-            ? String(format: "%.1f km", metres / 1000)
-            : String(format: "%.0f m", metres)
+    private func formatDistance(_ metres: Double) -> String {
+        let feet = metres * 3.28084
+        if feet >= 1000 {
+            return String(format: "%.1f mi", feet / 5280)
+        }
+        return String(format: "%.0f ft", feet)
+    }
+
+    private func formatDistanceSpeech(_ metres: Double) -> String {
+        let feet = metres * 3.28084
+        if feet >= 5280 {
+            let miles = feet / 5280
+            return String(format: "%.1f miles remaining", miles)
+        }
+        if feet >= 1000 {
+            let miles = feet / 5280
+            return String(format: "%.2f miles remaining", miles)
+        }
+        return "\(Int(feet)) feet remaining"
     }
 
     // MARK: - Geometry helpers
@@ -258,6 +273,7 @@ extension NavigationViewModel: CLLocationManagerDelegate {
         let heading = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
         Task { @MainActor in
             self.userHeading = heading
+            self.compassHeading = heading
             if self.isNavigating, let loc = self.userLocation {
                 self.updateNavigation(from: loc)
             }
