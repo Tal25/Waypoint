@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- ── Location ──────────────────────────────────────────────────── -->
+    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+    <string>Waypoint needs your location at all times — including with the screen off — to keep the audio tone pointed toward your destination.</string>
+
+    <key>NSLocationAlwaysUsageDescription</key>
+    <string>Waypoint needs background location access so navigation continues when the screen is off.</string>
+
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Waypoint uses your location to guide you to your destination with spatial audio.</string>
+
+    <!-- ── Camera (Phase 2 — LiDAR indoor navigation) ────────────────── -->
+    <key>NSCameraUsageDescription</key>
+    <string>Waypoint uses the camera and LiDAR sensor (on supported devices) to detect obstacles and doorways for indoor navigation.</string>
+
+    <!-- ── Microphone (required by ARKit even if not recording audio) ── -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Microphone access is required by the AR framework for indoor spatial tracking.</string>
+
+    <!-- ── Background modes ───────────────────────────────────────────── -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>location</string>
+        <string>audio</string>
+    </array>
+
+    <!-- ── App transport (OSRM is HTTP on some mirrors — allow it) ────── -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <false/>
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>router.project-osrm.org</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <false/>
+                <key>NSIncludesSubdomains</key>
+                <true/>
+            </dict>
+        </dict>
+    </dict>
+
+    <!-- ── Standard keys ─────────────────────────────────────────────── -->
+    <key>CFBundleName</key>
+    <string>Waypoint</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>Waypoint</string>
+
+    <key>UILaunchScreen</key>
+    <dict/>
+
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>location-services</string>
+        <string>gps</string>
+    </array>
+
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+
+</dict>
+</plist>
