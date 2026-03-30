@@ -3,7 +3,7 @@ import AVFoundation
 /// Owns a completely separate AVAudioEngine from AudioNavigationEngine.
 /// No shared state with the navigation audio — switching tabs cannot
 /// interrupt or modify the navigation tone in any way.
-class CameraAudioFeedback: NSObject {
+class CameraAudioFeedback: NSObject, ObservableObject {
 
     // MARK: - Private audio engine
     private let audioEngine = AVAudioEngine()
