@@ -133,7 +133,7 @@ struct ContentView: View {
                 .animation(.easeOut(duration: 0.25), value: formattedDistance)
                 .accessibilityLabel("Distance: \(formattedDistance)")
                 .accessibilityAddTraits(.updatesFrequently)
-                .onChange(of: formattedDistance) { _, new in
+                .onChange(of: formattedDistance) { new in
                     UIAccessibility.post(notification: .announcement,
                                          argument: "Distance: \(new)")
                 }
