@@ -18,8 +18,7 @@ struct CameraTabView: View {
 
     let vm: NavigationViewModel
 
-    @StateObject private var analyzer    = ARSceneAnalyzer()
-    @StateObject private var cameraAudio = CameraAudioFeedback()
+    @StateObject private var analyzer = ARSceneAnalyzer()
 
     @State private var audioFeedbackEnabled = true
     @State private var showDebug            = false
@@ -81,15 +80,13 @@ struct CameraTabView: View {
             }
         }
         .onAppear {
-            analyzer.headingDegrees      = vm.compassHeading
+            analyzer.headingDegrees         = vm.compassHeading
             analyzer.userFarFromDestination = vm.distanceMetres > 8.0
             updateDestinationBearing()
             analyzer.startSession()
-            cameraAudio.start()
         }
         .onDisappear {
             analyzer.pauseSession()
-            cameraAudio.stop()
         }
         // ── Heading + distance → analyzer inputs ────────────────────────
         .onChange(of: vm.compassHeading)  { heading in
@@ -112,14 +109,14 @@ struct CameraTabView: View {
         }
         // ── Obstacle audio + accessibility ──────────────────────────────
         .onChange(of: analyzer.obstacleDistanceFt) { dist in
-            cameraAudio.checkObstacle(distanceFt: dist, audioEnabled: audioFeedbackEnabled)
+            if audioFeedbackEnabled {
+                if dist < 6.6 { vm.audio.playObstacleWarning() }
+                else           { vm.audio.clearObstacle() }
+            }
             postThresholdNotificationIfNeeded(dist)
         }
-        .onChange(of: analyzer.surfaceClassification) { surface in
-            cameraAudio.checkSurface(surface, audioEnabled: audioFeedbackEnabled)
-        }
         .onChange(of: analyzer.thermalWarning) { isHot in
-            if isHot { cameraAudio.announceThermalWarning() }
+            if isHot { vm.audio.playError() }
         }
     }
 
@@ -357,13 +354,6 @@ struct CameraTabView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.ignoresSafeArea())
-        .onAppear {
-            let utt = AVSpeechUtterance(
-                string: "Camera access required. Go to Settings to enable camera.")
-            utt.voice = AVSpeechSynthesisVoice(language: "en-US")
-            utt.rate  = 0.52
-            AVSpeechSynthesizer().speak(utt)
-        }
     }
 
     // MARK: - Accessibility

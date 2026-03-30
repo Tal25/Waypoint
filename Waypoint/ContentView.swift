@@ -1,9 +1,11 @@
 import SwiftUI
 import UIKit
+import MapKit
 
 struct ContentView: View {
-    @StateObject private var vm = NavigationViewModel()
-    @State private var welcomeSpoken = false
+    @StateObject private var vm     = NavigationViewModel()
+    @StateObject private var search = LocationSearchService()
+    @State private var showSearch   = false
 
     var body: some View {
         TabView {
@@ -19,7 +21,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Navigation tab content (exact existing screen, moved to computed var)
+    // MARK: - Navigation tab content
 
     private var navigationContent: some View {
         ZStack {
@@ -42,8 +44,8 @@ struct ContentView: View {
 
             VStack(spacing: 0) {
 
-                // ── Status card ─────────────────────────────────────────
-                statusCard
+                // ── Search / destination card ────────────────────────────
+                destinationCard
                     .padding(.top, 60)
                     .padding(.horizontal, 24)
 
@@ -62,12 +64,14 @@ struct ContentView: View {
 
                 Spacer()
 
-                // ── Pan visualiser (sighted companion) ──────────────────
-                PanVisualiserView(panValue: vm.audio.isPanning)
-                    .frame(height: 24)
-                    .padding(.horizontal, 48)
-                    .accessibilityHidden(true)
-                    .padding(.bottom, 12)
+                // ── Direction indicator ──────────────────────────────────
+                if vm.isNavigating {
+                    PanVisualiserView(panValue: vm.audio.isPanning)
+                        .frame(height: 24)
+                        .padding(.horizontal, 48)
+                        .accessibilityHidden(true)
+                        .padding(.bottom, 12)
+                }
 
                 // ── GPS pill ────────────────────────────────────────────
                 GPSPill(accuracy: vm.gpsAccuracy)
@@ -77,62 +81,73 @@ struct ContentView: View {
                 // ── Bottom action ───────────────────────────────────────
                 if vm.isNavigating {
                     stopButton
+                } else if vm.destinationSet {
+                    startButton
                 } else {
-                    tapToStartArea
+                    gpsStatusArea
                 }
             }
             .padding(.bottom, 48)
         }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            guard !vm.isNavigating else { return }
-            if vm.isGPSReady {
-                vm.startNavigation()
-            } else {
-                vm.audio.speak("Waiting for GPS signal.")
-            }
-        }
         .onAppear {
             vm.requestPermissions()
-            if !welcomeSpoken {
-                welcomeSpoken = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    vm.audio.speak("Press anywhere on the screen to start navigation.")
-                }
-            }
+        }
+        .sheet(isPresented: $showSearch) {
+            SearchSheet(search: search, vm: vm, isPresented: $showSearch)
         }
     }
 
-    // MARK: - Status card
+    // MARK: - Destination / search card
 
-    private var statusCard: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "mappin.circle.fill")
-                .font(.system(size: 22))
-                .foregroundStyle(.cyan)
+    private var destinationCard: some View {
+        Button(action: { if !vm.isNavigating { showSearch = true } }) {
+            HStack(spacing: 14) {
+                Image(systemName: vm.destinationSet ? "location.fill" : "magnifyingglass")
+                    .font(.system(size: 20))
+                    .foregroundStyle(.cyan)
+                    .frame(width: 24)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Destination")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.45))
-                    .kerning(1.2)
-                    .textCase(.uppercase)
-                Text(vm.statusMessage)
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
+                VStack(alignment: .leading, spacing: 2) {
+                    if vm.destinationSet {
+                        Text("Destination")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.45))
+                            .kerning(1.2)
+                            .textCase(.uppercase)
+                        Text(vm.destinationName)
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                    } else {
+                        Text("Where to?")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                }
+
+                Spacer()
+
+                if vm.destinationSet && !vm.isNavigating {
+                    Button(action: vm.clearDestination) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 20))
+                            .foregroundStyle(.white.opacity(0.35))
+                    }
+                    .accessibilityLabel("Clear destination")
+                }
             }
-            Spacer()
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .strokeBorder(.white.opacity(0.12), lineWidth: 1)
+            )
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 14)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
-        .overlay(
-            RoundedRectangle(cornerRadius: 18)
-                .strokeBorder(.white.opacity(0.12), lineWidth: 1)
-        )
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Status: \(vm.statusMessage)")
+        .buttonStyle(.plain)
+        .accessibilityLabel(vm.destinationSet
+            ? "Destination: \(vm.destinationName). Tap to change."
+            : "Search for a destination")
     }
 
     // MARK: - Distance display
@@ -190,26 +205,43 @@ struct ContentView: View {
         .accessibilitySortPriority(1000)
     }
 
-    // MARK: - Tap to start
+    // MARK: - Start button
 
-    private var tapToStartArea: some View {
-        VStack(spacing: 10) {
+    private var startButton: some View {
+        Button(action: vm.startNavigation) {
+            HStack(spacing: 10) {
+                Image(systemName: "location.north.fill")
+                    .font(.system(size: 20))
+                Text("Start")
+                    .font(.system(size: 18, weight: .semibold))
+            }
+            .foregroundStyle(.black)
+            .frame(maxWidth: .infinity)
+            .frame(height: 64)
+            .background(vm.isGPSReady ? Color.cyan : Color.gray.opacity(0.5))
+            .clipShape(RoundedRectangle(cornerRadius: 20))
+        }
+        .padding(.horizontal, 32)
+        .disabled(!vm.isGPSReady)
+        .accessibilityLabel(vm.isGPSReady ? "Start navigation" : "Waiting for GPS signal")
+        .accessibilityHint("Double tap to begin audio guidance to \(vm.destinationName)")
+    }
+
+    // MARK: - GPS status (no destination selected)
+
+    private var gpsStatusArea: some View {
+        HStack(spacing: 10) {
             if !vm.isGPSReady {
-                HStack(spacing: 10) {
-                    ProgressView()
-                        .tint(.white.opacity(0.5))
-                        .scaleEffect(0.85)
-                    Text("Acquiring GPS signal…")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.45))
-                }
+                ProgressView().tint(.white.opacity(0.5)).scaleEffect(0.85)
+                Text("Acquiring GPS signal…")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.4))
             } else {
-                Image(systemName: "hand.tap.fill")
-                    .font(.system(size: 22))
-                    .foregroundStyle(.white.opacity(0.25))
-                Text("Tap anywhere to start")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.45))
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.white.opacity(0.3))
+                Text("Search for a destination above")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.4))
             }
         }
         .frame(height: 64)
@@ -405,6 +437,130 @@ struct GPSPill: View {
         guard accuracy >= 0 else { return "No GPS" }
         let feet = Int((accuracy * 3.28084).rounded())
         return "±\(feet) ft"
+    }
+}
+
+// MARK: - Search Sheet
+
+struct SearchSheet: View {
+    @ObservedObject var search: LocationSearchService
+    let vm: NavigationViewModel
+    @Binding var isPresented: Bool
+
+    @FocusState private var isFocused: Bool
+    @State private var resolving = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+
+                // ── Search field ─────────────────────────────────────────
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search destination", text: $search.query)
+                        .focused($isFocused)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .submitLabel(.search)
+                    if !search.query.isEmpty {
+                        Button(action: { search.query = "" }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(12)
+                .background(Color(.systemGray6), in: RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 12)
+
+                Divider()
+
+                // ── Results ──────────────────────────────────────────────
+                if search.completions.isEmpty {
+                    emptyState
+                } else {
+                    List(search.completions, id: \.self) { item in
+                        Button(action: { select(item) }) {
+                            HStack(spacing: 12) {
+                                Image(systemName: "mappin")
+                                    .foregroundStyle(.cyan)
+                                    .frame(width: 20)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.title)
+                                        .font(.system(size: 15, weight: .medium))
+                                        .foregroundStyle(.primary)
+                                    if !item.subtitle.isEmpty {
+                                        Text(item.subtitle)
+                                            .font(.system(size: 13))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                        .disabled(resolving)
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("Choose Destination")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+        .onAppear {
+            isFocused = true
+            if let coord = vm.userCoordinate {
+                search.setRegion(near: coord)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var emptyState: some View {
+        VStack(spacing: 16) {
+            if search.isSearching {
+                ProgressView()
+            } else if search.query.isEmpty {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.secondary)
+                Text("Type a place or address")
+                    .foregroundStyle(.secondary)
+            } else {
+                Image(systemName: "mappin.slash")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.secondary)
+                Text("No results found")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func select(_ item: MKLocalSearchCompletion) {
+        resolving = true
+        Task {
+            do {
+                let (coord, name) = try await search.resolve(item)
+                vm.setDestination(coord, name: name)
+                dismiss()
+            } catch {
+                vm.audio.playError()
+            }
+            resolving = false
+        }
+    }
+
+    private func dismiss() {
+        search.query = ""
+        isPresented  = false
     }
 }
 

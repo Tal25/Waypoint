@@ -1,6 +1,5 @@
 import ARKit
 import CoreLocation
-import AVFoundation
 
 // MARK: - ARSceneAnalyzer
 
@@ -52,7 +51,6 @@ class ARSceneAnalyzer: NSObject, ObservableObject {
     private let locationManager   = CLLocationManager()
     private var currentCoordinate: CLLocationCoordinate2D?
 
-    private let speech = AVSpeechSynthesizer()
 
     // MARK: - Init
 
@@ -147,20 +145,11 @@ class ARSceneAnalyzer: NSObject, ObservableObject {
         case .critical:
             analysisInterval = 999
             DispatchQueue.main.async { self.thermalWarning = true }
-            speak("Pausing camera to cool down.")
         @unknown default:
             break
         }
     }
 
-    // MARK: - Speech
-
-    private func speak(_ text: String) {
-        let utt = AVSpeechUtterance(string: text)
-        utt.voice = AVSpeechSynthesisVoice(language: "en-US")
-        utt.rate  = 0.52
-        speech.speak(utt)
-    }
 }
 
 // MARK: - ARSessionDelegate
@@ -210,7 +199,7 @@ extension ARSceneAnalyzer {
 
         // Safety stop: obstacle < 0.5 m (1.64 ft)
         if distFt < 1.64 {
-            if !stopAnnounced { speak("Stop."); stopAnnounced = true }
+            stopAnnounced = true
             DispatchQueue.main.async { [weak self] in
                 self?.obstacleDistanceFt      = distFt
                 self?.suggestedMicroWaypoint  = nil
@@ -468,9 +457,6 @@ extension ARSceneAnalyzer {
             if now.timeIntervalSince(lastModeSwitch) >= 5.0 {
                 pathfindingActive = shouldBeActive
                 lastModeSwitch    = now
-                let msg = shouldBeActive ? "Camera guidance active."
-                                         : "GPS guidance active."
-                speak(msg)
                 let mode = shouldBeActive ? "Camera path" : "GPS only"
                 DispatchQueue.main.async { self.pathfindingMode = mode }
             }
@@ -488,10 +474,7 @@ extension ARSceneAnalyzer {
 
         // All cells unknown or occupied — fallback to GPS
         guard fc > 0 else {
-            if !pathUnclearAnnounced {
-                pathUnclearAnnounced = true
-                speak("Area unmapped, using GPS.")
-            }
+            pathUnclearAnnounced = true
             DispatchQueue.main.async {
                 self.suggestedMicroWaypoint = nil
                 self.microWaypointGridRow   = -1
@@ -502,10 +485,7 @@ extension ARSceneAnalyzer {
         }
 
         guard let candidate = occupancyGrid.selectBestCell(destinationBearingDeg: destinationBearing) else {
-            if !pathUnclearAnnounced {
-                pathUnclearAnnounced = true
-                speak("Path unclear, using GPS.")
-            }
+            pathUnclearAnnounced = true
             DispatchQueue.main.async {
                 self.suggestedMicroWaypoint = nil
                 self.microWaypointGridRow   = -1
