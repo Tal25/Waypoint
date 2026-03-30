@@ -11,14 +11,15 @@ class NavigationViewModel: NSObject, ObservableObject {
     @Published var isNavigating = false
     @Published var hasLocationPermission = false
     @Published var statusMessage = "Tap Start to begin navigation"
+    @Published var isGPSReady = false  // true when accuracy ≤ 20 m
 
     // MARK: - Audio engine (shared with ContentView)
     let audio = AudioNavigationEngine()
 
     // MARK: - Destination (hardcoded test point — Berkeley, CA)
     private let destination = CLLocationCoordinate2D(
-        latitude:  37.87601674583654,
-        longitude: -122.25893426474539
+        latitude:  37.876027202348325,
+        longitude: -122.25849044991348
     )
 
     // MARK: - Private
@@ -57,8 +58,8 @@ class NavigationViewModel: NSObject, ObservableObject {
             audio.speak("Location permission is required. Please enable it in Settings.")
             return
         }
-        guard let loc = userLocation else {
-            audio.speak("Waiting for GPS signal. Please wait a moment and try again.")
+        guard isGPSReady, let loc = userLocation else {
+            audio.speak("Waiting for GPS signal.")
             return
         }
 
@@ -240,6 +241,15 @@ extension NavigationViewModel: CLLocationManagerDelegate {
         Task { @MainActor in
             self.userLocation = loc
             self.gpsAccuracy = loc.horizontalAccuracy
+            let ready = loc.horizontalAccuracy > 0 && loc.horizontalAccuracy <= 20
+            if ready != self.isGPSReady {
+                self.isGPSReady = ready
+                if !ready {
+                    self.statusMessage = "Waiting for GPS signal…"
+                } else if !self.isNavigating {
+                    self.statusMessage = "Tap Start to begin navigation"
+                }
+            }
             if self.isNavigating { self.updateNavigation(from: loc) }
         }
     }

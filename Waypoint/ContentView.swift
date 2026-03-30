@@ -49,22 +49,30 @@ struct ContentView: View {
                     .padding(.bottom, 32)
 
                 // ── Start / Stop button ───────────────────────────────────
+                let startEnabled = vm.isNavigating || vm.isGPSReady
                 Button(action: toggleNavigation) {
                     Text(vm.isNavigating ? "Stop" : "Start")
                         .font(.system(size: 38, weight: .heavy))
                         .foregroundColor(.black)
                         .frame(maxWidth: .infinity)
                         .frame(height: 80)
-                        .background(vm.isNavigating ? Color.red : Color(red: 0.2, green: 0.9, blue: 0.4))
+                        .background(
+                            vm.isNavigating ? Color.red :
+                            startEnabled ? Color(red: 0.2, green: 0.9, blue: 0.4) :
+                            Color.gray
+                        )
                         .cornerRadius(22)
                 }
+                .disabled(!startEnabled)
                 .padding(.horizontal, 32)
                 .padding(.bottom, 56)
                 // Make this the first VoiceOver element on screen
                 .accessibilityLabel(vm.isNavigating ? "Stop navigation" : "Start navigation")
                 .accessibilityHint(vm.isNavigating
                     ? "Double tap to stop audio guidance"
-                    : "Double tap to begin audio guidance to destination")
+                    : startEnabled
+                        ? "Double tap to begin audio guidance to destination"
+                        : "Waiting for GPS signal")
                 .accessibilitySortPriority(1000)
                 .accessibilityAddTraits(.isButton)
             }
