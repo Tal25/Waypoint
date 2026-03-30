@@ -17,6 +17,7 @@ class ARSceneAnalyzer: NSObject, ObservableObject {
     @Published var suggestedMicroWaypoint: CLLocationCoordinate2D? = nil
     @Published var isSessionRunning: Bool         = false
     @Published var thermalWarning: Bool           = false
+    @Published var latestGrid: OccupancyGrid      = OccupancyGrid()
 
     // MARK: - Public session (shared with ARViewContainer)
     let session = ARSession()
@@ -27,6 +28,7 @@ class ARSceneAnalyzer: NSObject, ObservableObject {
     // MARK: - Private
     private var isLiDAR = false
     private var savedConfig: ARWorldTrackingConfiguration?
+    private var occupancyGrid = OccupancyGrid()
     private let analysisQueue = DispatchQueue(label: "ar.analysis", qos: .userInitiated)
     private var lastAnalysisTime: Date = .distantPast
     private var analysisInterval: TimeInterval = 0.5   // 2 fps nominal
@@ -198,6 +200,9 @@ extension ARSceneAnalyzer {
 
         // ── Step 4: Micro-waypoint ─────────────────────────────────────────
         let waypoint = generateMicroWaypoint(openingBearing: opening)
+
+        // ── Step 5: Occupancy grid (isolated — not yet wired to navigation) ─
+        updateOccupancyGrid(frame)
 
         DispatchQueue.main.async { [weak self] in
             self?.obstacleDistanceFt       = distanceFt
@@ -470,6 +475,93 @@ extension ARSceneAnalyzer {
             latitude:  coord.latitude  + latOffset,
             longitude: coord.longitude + lngOffset
         )
+    }
+}
+
+// MARK: - Occupancy grid population
+
+extension ARSceneAnalyzer {
+
+    /// Rebuild the occupancy grid from the current frame's mesh anchors.
+    /// Grid is centred on the camera. Called on analysisQueue; publishes result to main.
+    /// NOT yet wired to navigation — inspect `latestGrid` to verify correctness.
+    private func updateOccupancyGrid(_ frame: ARFrame) {
+        let cam   = frame.camera.transform
+        let camX  = cam.columns.3.x
+        let camY  = cam.columns.3.y
+        let camZ  = cam.columns.3.z
+        let fwdX  = -cam.columns.2.x
+        let fwdZ  = -cam.columns.2.z
+
+        occupancyGrid.reset(cameraX: camX, cameraZ: camZ)
+
+        // Non-LiDAR: no mesh data — publish empty grid and return
+        guard isLiDAR else {
+            let g = occupancyGrid
+            DispatchQueue.main.async { self.latestGrid = g }
+            return
+        }
+
+        // Obstacle height band relative to camera
+        // Camera is typically ~1.5 m above floor, so:
+        //   floor  ≈ camY − 1.7   (give 0.2 m margin below camera − 1.5)
+        //   head   ≈ camY + 0.3
+        let floorY = camY - 1.7
+        let headY  = camY + 0.3
+
+        for anchor in frame.anchors {
+            guard let mesh = anchor as? ARMeshAnchor else { continue }
+
+            // Skip anchors more than 6 m away (cheap pre-filter)
+            let ax = mesh.transform.columns.3.x
+            let az = mesh.transform.columns.3.z
+            let dx = ax - camX;  let dz = az - camZ
+            guard dx * dx + dz * dz < 36 else { continue }
+
+            let geo      = mesh.geometry.vertices
+            let count    = geo.count
+            guard count > 0 else { continue }
+
+            let stride   = geo.stride
+            let offset   = geo.offset
+            let buf      = geo.buffer.contents()
+            let xform    = mesh.transform
+
+            // Sample at most ~300 vertices per anchor for performance
+            let step = max(1, count / 300)
+            var i    = 0
+            while i < count {
+                let ptr = buf.advanced(by: offset + i * stride)
+                             .assumingMemoryBound(to: Float.self)
+                let lx = ptr[0];  let ly = ptr[1];  let lz = ptr[2]
+
+                // Local → world (manual SIMD4 multiply, avoids importing simd)
+                let wx = xform.columns.0.x * lx + xform.columns.1.x * ly
+                       + xform.columns.2.x * lz + xform.columns.3.x
+                let wy = xform.columns.0.y * lx + xform.columns.1.y * ly
+                       + xform.columns.2.y * lz + xform.columns.3.y
+                let wz = xform.columns.0.z * lx + xform.columns.1.z * ly
+                       + xform.columns.2.z * lz + xform.columns.3.z
+
+                if wy > floorY + 0.15 && wy < headY {
+                    occupancyGrid.mark(x: wx, z: wz, as: .occupied)
+                } else if wy <= floorY + 0.15 {
+                    occupancyGrid.mark(x: wx, z: wz, as: .free)
+                }
+
+                i += step
+            }
+        }
+
+        // Log clearest path for isolation testing (remove once wired to navigation)
+        if let angle = occupancyGrid.clearestForwardBearing(forwardX: fwdX, forwardZ: fwdZ) {
+            let dir = angle > 1 ? "right" : angle < -1 ? "left" : "straight"
+            print("[OccupancyGrid] clearest: \(Int(angle))° (\(dir)) | "
+                  + "occupied=\(occupancyGrid.occupiedCount) free=\(occupancyGrid.freeCount)")
+        }
+
+        let g = occupancyGrid
+        DispatchQueue.main.async { self.latestGrid = g }
     }
 }
 

@@ -31,6 +31,7 @@ class NavigationViewModel: NSObject, ObservableObject {
     private var waypoints: [CLLocationCoordinate2D] = []
     private var currentWaypointIndex = 0
     private var announcedMilestones: Set<Int> = []
+    private var microWaypoint: CLLocationCoordinate2D?
 
     private let distanceMilestones: [Double] = [500, 300, 200, 100, 50, 20]
 
@@ -78,8 +79,15 @@ class NavigationViewModel: NSObject, ObservableObject {
         isNavigating = false
         waypoints = []
         currentWaypointIndex = 0
+        microWaypoint = nil
         audio.stopNavigation()
         statusMessage = "Navigation stopped"
+    }
+
+    /// Temporarily steer toward a nearby AR-detected opening.
+    /// Clears automatically when user comes within 3 m of the coordinate.
+    func setMicroWaypoint(_ coord: CLLocationCoordinate2D) {
+        microWaypoint = coord
     }
 
     // MARK: - OSRM route fetch
@@ -133,12 +141,17 @@ class NavigationViewModel: NSObject, ObservableObject {
     // MARK: - Navigation update (called on every location/heading change)
 
     private func updateNavigation(from userLoc: CLLocation) {
-        let target = currentTarget()
-        let targetLoc = CLLocation(latitude: target.latitude, longitude: target.longitude)
-
-        // Advance waypoint when within 12 m
-        if targetLoc.distance(from: userLoc) < 12, currentWaypointIndex < waypoints.count - 1 {
+        // Route advancement uses the real route target only — never the micro-waypoint
+        let routeTarget    = routeCurrentTarget()
+        let routeTargetLoc = CLLocation(latitude: routeTarget.latitude, longitude: routeTarget.longitude)
+        if routeTargetLoc.distance(from: userLoc) < 12, currentWaypointIndex < waypoints.count - 1 {
             currentWaypointIndex += 1
+        }
+
+        // Clear micro-waypoint once user is within 3 m of it
+        if let micro = microWaypoint {
+            let microLoc = CLLocation(latitude: micro.latitude, longitude: micro.longitude)
+            if microLoc.distance(from: userLoc) < 3.0 { microWaypoint = nil }
         }
 
         let totalDist = totalRemainingDistance(from: userLoc.coordinate)
@@ -160,14 +173,19 @@ class NavigationViewModel: NSObject, ObservableObject {
         checkMilestones(distance: totalDist)
     }
 
-    private func currentTarget() -> CLLocationCoordinate2D {
+    private func routeCurrentTarget() -> CLLocationCoordinate2D {
         guard !waypoints.isEmpty else { return destination }
         return waypoints[min(currentWaypointIndex, waypoints.count - 1)]
     }
 
+    private func currentTarget() -> CLLocationCoordinate2D {
+        if let micro = microWaypoint { return micro }
+        return routeCurrentTarget()
+    }
+
     private func totalRemainingDistance(from coord: CLLocationCoordinate2D) -> Double {
         guard !waypoints.isEmpty else { return haversine(from: coord, to: destination) }
-        var total = haversine(from: coord, to: currentTarget())
+        var total = haversine(from: coord, to: routeCurrentTarget())
         for i in currentWaypointIndex ..< waypoints.count - 1 {
             total += haversine(from: waypoints[i], to: waypoints[i + 1])
         }
