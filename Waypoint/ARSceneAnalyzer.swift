@@ -362,7 +362,7 @@ extension ARSceneAnalyzer {
         let faceCount = mesh.faces.count
         guard faceCount > 0 else { return "unknown" }
 
-        let classifications = mesh.classification
+        guard let classifications = mesh.classification else { return "unknown" }
         let classPtr = classifications.buffer.contents()
             .assumingMemoryBound(to: UInt8.self)
 
