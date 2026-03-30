@@ -6,6 +6,22 @@ struct ContentView: View {
     @State private var welcomeSpoken = false
 
     var body: some View {
+        TabView {
+            // ── Tab 1: Navigation (existing screen, zero changes) ──────
+            navigationContent
+                .tabItem { Label("Navigate", systemImage: "waveform") }
+                .accessibilityLabel("Navigation tab")
+
+            // ── Tab 2: Camera ──────────────────────────────────────────
+            CameraTabView(vm: vm)
+                .tabItem { Label("Camera", systemImage: "camera") }
+                .accessibilityLabel("Camera tab, AR scene analysis")
+        }
+    }
+
+    // MARK: - Navigation tab content (exact existing screen, moved to computed var)
+
+    private var navigationContent: some View {
         ZStack {
             // Background gradient
             LinearGradient(
@@ -67,7 +83,6 @@ struct ContentView: View {
             }
             .padding(.bottom, 48)
         }
-        // Tap anywhere to start (when not navigating)
         .contentShape(Rectangle())
         .onTapGesture {
             guard !vm.isNavigating else { return }
