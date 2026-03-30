@@ -85,9 +85,14 @@ class NavigationViewModel: NSObject, ObservableObject {
     }
 
     /// Temporarily steer toward a nearby AR-detected opening.
-    /// Clears automatically when user comes within 3 m of the coordinate.
+    /// Clears automatically when user comes within 1 m of the coordinate.
     func setMicroWaypoint(_ coord: CLLocationCoordinate2D) {
         microWaypoint = coord
+    }
+
+    /// Clear the active micro-waypoint immediately (safety stop or path unavailable).
+    func clearMicroWaypoint() {
+        microWaypoint = nil
     }
 
     // MARK: - OSRM route fetch
@@ -148,10 +153,10 @@ class NavigationViewModel: NSObject, ObservableObject {
             currentWaypointIndex += 1
         }
 
-        // Clear micro-waypoint once user is within 3 m of it
+        // Clear micro-waypoint once user is within 1.0 m of it
         if let micro = microWaypoint {
             let microLoc = CLLocation(latitude: micro.latitude, longitude: micro.longitude)
-            if microLoc.distance(from: userLoc) < 3.0 { microWaypoint = nil }
+            if microLoc.distance(from: userLoc) < 1.0 { microWaypoint = nil }
         }
 
         let totalDist = totalRemainingDistance(from: userLoc.coordinate)

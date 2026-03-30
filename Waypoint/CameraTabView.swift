@@ -9,15 +9,14 @@ struct CameraTabView: View {
 
     let vm: NavigationViewModel
 
-    @StateObject private var analyzer     = ARSceneAnalyzer()
-    @StateObject private var cameraAudio  = CameraAudioFeedback()
+    @StateObject private var analyzer    = ARSceneAnalyzer()
+    @StateObject private var cameraAudio = CameraAudioFeedback()
 
     @State private var audioFeedbackEnabled = true
     @State private var showDebug            = false
-    @State private var cameraPermission: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
-
-    // Threshold crossing tracking for accessibility notifications
-    @State private var prevThresholdBucket: Int = 0   // 0=clear, 1=near, 2=veryClose
+    @State private var cameraPermission: AVAuthorizationStatus =
+        AVCaptureDevice.authorizationStatus(for: .video)
+    @State private var prevThresholdBucket: Int = 0
 
     var body: some View {
         Group {
@@ -27,23 +26,21 @@ struct CameraTabView: View {
             case .denied, .restricted:
                 permissionDeniedView
             default:
-                permissionDeniedView   // .notDetermined — request happens in onAppear
+                permissionDeniedView
             }
         }
-        .onAppear {
-            requestCameraPermissionIfNeeded()
-        }
+        .onAppear { requestCameraPermissionIfNeeded() }
     }
 
     // MARK: - Main camera content
 
     private var cameraContent: some View {
         ZStack {
-            // ── Layer 1: AR camera feed (full screen) ──────────────────
+            // ── Layer 1: AR camera feed ─────────────────────────────────
             ARViewContainer(session: analyzer.session, showDebug: showDebug)
                 .ignoresSafeArea(.all)
 
-            // ── Layer 2: HUD overlay ───────────────────────────────────
+            // ── Layer 2: HUD ────────────────────────────────────────────
             VStack(spacing: 0) {
                 topInfoPanel
                     .padding(.top, 52)
@@ -51,7 +48,6 @@ struct CameraTabView: View {
 
                 Spacer()
 
-                // Crosshair
                 crosshair
 
                 Spacer()
@@ -63,9 +59,22 @@ struct CameraTabView: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 12)
             }
+
+            // ── Layer 3: Occupancy grid mini-map (bottom-left) ──────────
+            VStack {
+                Spacer()
+                HStack {
+                    occupancyGridView
+                        .padding(.leading, 12)
+                        .padding(.bottom, 100)   // above control strip
+                    Spacer()
+                }
+            }
         }
         .onAppear {
-            analyzer.headingDegrees = vm.compassHeading
+            analyzer.headingDegrees      = vm.compassHeading
+            analyzer.userFarFromDestination = vm.distanceMetres > 8.0
+            updateDestinationBearing()
             analyzer.startSession()
             cameraAudio.start()
         }
@@ -73,9 +82,26 @@ struct CameraTabView: View {
             analyzer.pauseSession()
             cameraAudio.stop()
         }
-        .onChange(of: vm.compassHeading) { heading in
+        // ── Heading + distance → analyzer inputs ────────────────────────
+        .onChange(of: vm.compassHeading)  { heading in
             analyzer.headingDegrees = heading
+            updateDestinationBearing()
         }
+        .onChange(of: vm.relativeBearing) { _ in
+            updateDestinationBearing()
+        }
+        .onChange(of: vm.distanceMetres)  { dist in
+            analyzer.userFarFromDestination = dist > 8.0
+        }
+        // ── Pathfinding output → NavigationViewModel ────────────────────
+        .onChange(of: analyzer.suggestedMicroWaypoint) { waypoint in
+            if let wp = waypoint {
+                vm.setMicroWaypoint(wp)
+            } else {
+                vm.clearMicroWaypoint()
+            }
+        }
+        // ── Obstacle audio + accessibility ──────────────────────────────
         .onChange(of: analyzer.obstacleDistanceFt) { dist in
             cameraAudio.checkObstacle(distanceFt: dist, audioEnabled: audioFeedbackEnabled)
             postThresholdNotificationIfNeeded(dist)
@@ -88,6 +114,11 @@ struct CameraTabView: View {
         }
     }
 
+    private func updateDestinationBearing() {
+        analyzer.destinationBearing =
+            (vm.compassHeading + vm.relativeBearing).truncatingRemainder(dividingBy: 360)
+    }
+
     // MARK: - Top info panel
 
     private var topInfoPanel: some View {
@@ -96,15 +127,19 @@ struct CameraTabView: View {
                     valueColor: trackingColor)
             infoRow(label: "Depth",    value: analyzer.depthMode,
                     valueColor: analyzer.depthMode == "LiDAR" ? .blue : .orange)
+            infoRow(label: "Mode",     value: analyzer.pathfindingMode,
+                    valueColor: analyzer.pathfindingMode == "Camera path" ? .green : .orange)
             infoRow(label: "Ahead",    value: String(format: "%.1f ft", analyzer.obstacleDistanceFt),
                     valueColor: obstacleColor, monospaced: true)
+            infoRow(label: "Next",     value: nextWaypointText,
+                    valueColor: .cyan, monospaced: true)
+            infoRow(label: "Map",      value: "\(analyzer.freeCellCount) free",
+                    valueColor: .white)
             infoRow(label: "Surface",  value: analyzer.surfaceClassification,
                     valueColor: .white)
             infoRow(label: "GPS",      value: gpsAccuracyText,
                     valueColor: gpsColor)
-            if analyzer.thermalWarning {
-                thermalWarningRow
-            }
+            if analyzer.thermalWarning { thermalWarningRow }
         }
         .padding(12)
         .background(Color.black.opacity(0.60))
@@ -112,6 +147,12 @@ struct CameraTabView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(combinedAccessibilityLabel)
         .accessibilityValue(combinedAccessibilityLabel)
+    }
+
+    private var nextWaypointText: String {
+        let distFt = Double(analyzer.microWaypointDistanceM) * 3.28084
+        guard distFt > 0.1 else { return "—" }
+        return String(format: "%.1f ft", distFt)
     }
 
     private func infoRow(label: String, value: String,
@@ -135,19 +176,14 @@ struct CameraTabView: View {
             .font(.system(size: 13, weight: .semibold, design: .monospaced))
             .foregroundStyle(.red)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .opacity(1)   // caller can add animation if desired
     }
 
     // MARK: - Crosshair
 
     private var crosshair: some View {
         ZStack {
-            Rectangle()
-                .fill(.white.opacity(0.80))
-                .frame(width: 40, height: 1)
-            Rectangle()
-                .fill(.white.opacity(0.80))
-                .frame(width: 1, height: 40)
+            Rectangle().fill(.white.opacity(0.80)).frame(width: 40, height: 1)
+            Rectangle().fill(.white.opacity(0.80)).frame(width: 1, height: 40)
         }
         .accessibilityHidden(true)
     }
@@ -156,14 +192,11 @@ struct CameraTabView: View {
 
     private var proximitySection: some View {
         VStack(spacing: 6) {
-            // Large distance number
             Text(String(format: "%.1f ft", analyzer.obstacleDistanceFt))
                 .font(.system(size: 28, weight: .bold, design: .monospaced))
                 .foregroundStyle(.white)
                 .accessibilityLabel("Obstacle distance")
                 .accessibilityValue(String(format: "%.0f feet", analyzer.obstacleDistanceFt))
-
-            // Proximity bar
             proximityBar
         }
     }
@@ -171,12 +204,7 @@ struct CameraTabView: View {
     private var proximityBar: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                // Track
-                Rectangle()
-                    .fill(.white.opacity(0.20))
-                    .frame(height: 8)
-
-                // Fill
+                Rectangle().fill(.white.opacity(0.20)).frame(height: 8)
                 Rectangle()
                     .fill(obstacleColor)
                     .frame(width: fillWidth(totalWidth: geo.size.width), height: 8)
@@ -224,6 +252,68 @@ struct CameraTabView: View {
         .cornerRadius(10)
     }
 
+    // MARK: - Occupancy grid mini-map
+
+    private var occupancyGridView: some View {
+        let side    = OccupancyGrid.side
+        let viewPt: CGFloat = 120
+        let cellPt  = viewPt / CGFloat(side)
+        let grid    = analyzer.latestGrid
+        let wpRow   = analyzer.microWaypointGridRow
+        let wpCol   = analyzer.microWaypointGridCol
+        let isLiDAR = analyzer.depthMode == "LiDAR"
+        let center  = OccupancyGrid.radius
+
+        return Canvas { ctx, size in
+            // Draw cells
+            for row in 0..<side {
+                for col in 0..<side {
+                    let value = grid.cells[row * side + col]
+                    let color: Color
+                    switch value {
+                    case OccupancyGrid.free:
+                        color = isLiDAR ? .green : Color(red: 0.4, green: 0.8, blue: 0.4)
+                    case OccupancyGrid.occupied:
+                        color = .red
+                    default:
+                        color = Color(white: 0.15)
+                    }
+                    let rect = CGRect(x: CGFloat(col) * cellPt,
+                                      y: CGFloat(row) * cellPt,
+                                      width: cellPt, height: cellPt)
+                    ctx.fill(Path(rect), with: .color(color))
+                }
+            }
+
+            // Micro-waypoint: yellow dot
+            if wpRow >= 0, wpCol >= 0 {
+                let wx = CGFloat(wpCol) * cellPt + cellPt / 2
+                let wy = CGFloat(wpRow) * cellPt + cellPt / 2
+                let cx = CGFloat(center) * cellPt + cellPt / 2
+                let cy = CGFloat(center) * cellPt + cellPt / 2
+                // Line from user to waypoint
+                var line = Path()
+                line.move(to: CGPoint(x: cx, y: cy))
+                line.addLine(to: CGPoint(x: wx, y: wy))
+                ctx.stroke(line, with: .color(.yellow.opacity(0.7)), lineWidth: 1)
+                // Yellow dot
+                ctx.fill(Path(ellipseIn: CGRect(x: wx - 3, y: wy - 3, width: 6, height: 6)),
+                         with: .color(.yellow))
+            }
+
+            // User: blue dot at grid centre
+            let ux = CGFloat(center) * cellPt + cellPt / 2
+            let uy = CGFloat(center) * cellPt + cellPt / 2
+            ctx.fill(Path(ellipseIn: CGRect(x: ux - 3, y: uy - 3, width: 6, height: 6)),
+                     with: .color(.blue))
+        }
+        .frame(width: viewPt, height: viewPt)
+        .background(Color.black.opacity(0.65))
+        .cornerRadius(8)
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.white.opacity(0.2), lineWidth: 0.5))
+        .accessibilityHidden(true)
+    }
+
     // MARK: - Permission denied
 
     private var permissionDeniedView: some View {
@@ -255,25 +345,24 @@ struct CameraTabView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.ignoresSafeArea())
         .onAppear {
-            let utterance = AVSpeechUtterance(
-                string: "Camera access required. Go to Settings to enable camera."
-            )
-            utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-            utterance.rate  = 0.52
-            AVSpeechSynthesizer().speak(utterance)
+            let utt = AVSpeechUtterance(
+                string: "Camera access required. Go to Settings to enable camera.")
+            utt.voice = AVSpeechSynthesisVoice(language: "en-US")
+            utt.rate  = 0.52
+            AVSpeechSynthesizer().speak(utt)
         }
     }
 
     // MARK: - Accessibility
 
     private var combinedAccessibilityLabel: String {
-        let dist     = String(format: "%.1f", analyzer.obstacleDistanceFt)
-        let gpsStr   = gpsAccuracyText
-        return "Tracking \(analyzer.trackingState.lowercased()). "
-            + "\(analyzer.depthMode) depth active. "
-            + "Obstacle \(dist) feet ahead. "
-            + "Surface \(analyzer.surfaceClassification). "
-            + "GPS \(gpsStr)."
+        let dist = String(format: "%.1f", analyzer.obstacleDistanceFt)
+        return "Mode \(analyzer.pathfindingMode). "
+             + "Tracking \(analyzer.trackingState.lowercased()). "
+             + "\(analyzer.depthMode) depth active. "
+             + "Obstacle \(dist) feet ahead. "
+             + "Surface \(analyzer.surfaceClassification). "
+             + "GPS \(gpsAccuracyText)."
     }
 
     private var proximityAccessibilityValue: String {
@@ -289,7 +378,6 @@ struct CameraTabView: View {
         else if dist > 6  { bucket = 1 }
         else if dist > 3  { bucket = 2 }
         else              { bucket = 3 }
-
         if bucket != prevThresholdBucket {
             prevThresholdBucket = bucket
             UIAccessibility.post(notification: .layoutChanged, argument: nil)
@@ -300,9 +388,9 @@ struct CameraTabView: View {
 
     private var trackingColor: Color {
         switch analyzer.trackingState {
-        case "Normal":        return .green
-        case "Limited":       return .yellow
-        default:              return .red
+        case "Normal":  return .green
+        case "Limited": return .yellow
+        default:        return .red
         }
     }
 
@@ -316,14 +404,12 @@ struct CameraTabView: View {
     private var gpsAccuracyText: String {
         let acc = vm.gpsAccuracy
         guard acc >= 0 else { return "No signal" }
-        let ft = Int((acc * 3.28084).rounded())
-        return "±\(ft) ft"
+        return "±\(Int((acc * 3.28084).rounded())) ft"
     }
 
     private var gpsColor: Color {
-        let acc = vm.gpsAccuracy
-        guard acc >= 0 else { return .red }
-        let ft = acc * 3.28084
+        let ft = vm.gpsAccuracy * 3.28084
+        guard vm.gpsAccuracy >= 0 else { return .red }
         if ft < 20 { return .green }
         if ft < 50 { return .yellow }
         return .red
