@@ -1,0 +1,46 @@
+name: Waypoint
+
+options:
+  bundleIdPrefix: com.tal25
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+
+targets:
+  Waypoint:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+
+    sources:
+      - path: Waypoint
+        excludes:
+          - Info.plist
+
+    info:
+      path: Waypoint/Info.plist
+      properties:
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIBackgroundModes:
+          - location
+          - audio
+        NSLocationAlwaysAndWhenInUseUsageDescription: "Waypoint needs your location at all times — including with the screen off — to keep the audio tone pointed toward your destination."
+        NSLocationAlwaysUsageDescription: "Waypoint needs background location access so navigation continues when the screen is off."
+        NSLocationWhenInUseUsageDescription: "Waypoint uses your location to guide you to your destination with spatial audio."
+        NSCameraUsageDescription: "Waypoint uses the camera and LiDAR sensor to detect obstacles for indoor navigation."
+        NSMicrophoneUsageDescription: "Microphone access is required by the AR framework for indoor spatial tracking."
+        UIRequiredDeviceCapabilities:
+          - location-services
+          - gps
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tal25.waypoint
+        SWIFT_VERSION: "5.9"
+        ENABLE_BITCODE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
