@@ -85,11 +85,16 @@ class AudioNavigationEngine: NSObject, ObservableObject {
         audioEngine.attach(effectPlayer)
         audioEngine.attach(spatialMixer)
 
+        // Use the buffer's actual PCM format for connections so scheduleBuffer
+        // never sees a channel-count mismatch at runtime.
+        let pianoFmt  = pianoBuffer?.format
+        let effectFmt = farBuffer?.format ?? closerBuffer?.format ?? obstacleBuffer?.format
+
         // Piano → spatialMixer (HRTF 3D) → mainMixer → output
-        audioEngine.connect(pianoPlayer,  to: spatialMixer,              format: nil)
+        audioEngine.connect(pianoPlayer,  to: spatialMixer,              format: pianoFmt)
         audioEngine.connect(spatialMixer, to: audioEngine.mainMixerNode, format: nil)
         // Effects → mainMixer direct (non-spatial, equal in both ears)
-        audioEngine.connect(effectPlayer, to: audioEngine.mainMixerNode, format: nil)
+        audioEngine.connect(effectPlayer, to: audioEngine.mainMixerNode, format: effectFmt)
 
         // 3D rendering — must be set after connecting to spatialMixer
         pianoPlayer.renderingAlgorithm = .HRTF
