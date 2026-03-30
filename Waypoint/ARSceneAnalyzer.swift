@@ -249,12 +249,10 @@ extension ARSceneAnalyzer {
 extension ARSceneAnalyzer {
 
     private func buildOccupancyGrid(frame: ARFrame) {
-        let cam   = frame.camera.transform
-        let camX  = cam.columns.3.x
-        let camY  = cam.columns.3.y
-        let camZ  = cam.columns.3.z
-        let fwdX  = -cam.columns.2.x
-        let fwdZ  = -cam.columns.2.z
+        let cam  = frame.camera.transform
+        let camX = cam.columns.3.x
+        let camY = cam.columns.3.y
+        let camZ = cam.columns.3.z
 
         // Capture GPS origin once (first fix while session is live)
         if occupancyGrid.sessionOriginLat == 0, let coord = currentCoordinate {
@@ -268,149 +266,176 @@ extension ARSceneAnalyzer {
 
         occupancyGrid.reset(cameraX: camX, cameraZ: camZ)
 
-        let floorY = camY - 1.7   // floor ≈ camera Y − 1.5 m, 0.2 m margin
-        let headY  = camY + 0.3   // max obstacle height
+        // ── Seed: user's position is walkable by definition ───────────────
+        occupancyGrid.seedUserPosition()
 
-        // ── Mesh anchors (LiDAR) ──────────────────────────────────────────
-        if isLiDAR {
-            for anchor in frame.anchors {
-                // ARPlaneAnchor: floor = free, other = occupied (in body zone)
-                if let plane = anchor as? ARPlaneAnchor {
-                    let ap   = plane.transform.columns.3
-                    let dist = simd_length(SIMD3<Float>(ap.x - camX, 0, ap.z - camZ))
-                    guard dist < 6 else { continue }
+        let headY = camY + 0.3    // obstacle ceiling (30 cm above camera)
+        let floorY = camY - 1.7   // estimated floor level
 
-                    switch plane.classification {
-                    case .floor:
-                        markPlane(plane, as: OccupancyGrid.free, floorY: floorY, headY: headY)
-                    case .wall, .ceiling, .seat, .table, .door, .window:
-                        markPlane(plane, as: OccupancyGrid.occupied, floorY: floorY, headY: headY)
-                    default:
-                        break
-                    }
-                }
+        // ── ARPlaneAnchor (both LiDAR and non-LiDAR) ─────────────────────
+        // Floor planes → free.  Non-floor planes at body height → occupied.
+        for anchor in frame.anchors {
+            guard let plane = anchor as? ARPlaneAnchor else { continue }
+            let ap   = plane.transform.columns.3
+            let dx   = ap.x - camX, dz = ap.z - camZ
+            guard dx * dx + dz * dz < 36 else { continue }   // within 6 m
 
-                // ARMeshAnchor: iterate sampled vertices
-                guard let mesh = anchor as? ARMeshAnchor else { continue }
-                let ap   = mesh.transform.columns.3
-                let dx   = ap.x - camX, dz = ap.z - camZ
-                guard dx * dx + dz * dz < 36 else { continue }  // within 6 m
-
-                let geo    = mesh.geometry.vertices
-                let count  = geo.count
-                guard count > 0 else { continue }
-                let stride = geo.stride
-                let offset = geo.offset
-                let buf    = geo.buffer.contents()
-                let xform  = mesh.transform
-                let step   = max(1, count / 300)
-
-                var i = 0
-                while i < count {
-                    let ptr = buf.advanced(by: offset + i * stride)
-                                 .assumingMemoryBound(to: Float.self)
-                    let lx = ptr[0], ly = ptr[1], lz = ptr[2]
-                    let wx = xform.columns.0.x*lx + xform.columns.1.x*ly + xform.columns.2.x*lz + xform.columns.3.x
-                    let wy = xform.columns.0.y*lx + xform.columns.1.y*ly + xform.columns.2.y*lz + xform.columns.3.y
-                    let wz = xform.columns.0.z*lx + xform.columns.1.z*ly + xform.columns.2.z*lz + xform.columns.3.z
-
-                    if wy > floorY + 0.15, wy < headY {
-                        occupancyGrid.mark(x: wx, z: wz, as: OccupancyGrid.occupied)
-                    } else if wy <= floorY + 0.15 {
-                        occupancyGrid.mark(x: wx, z: wz, as: OccupancyGrid.free)
-                    }
-                    i += step
-                }
-            }
-
-            // Depth buffer → occupied cells (close obstacles not yet in mesh)
-            if let depthMap = frame.smoothedSceneDepth?.depthMap {
-                markDepthOccupancy(depthMap: depthMap, cam: frame.camera)
-            }
-
-        } else {
-            // Non-LiDAR: plane anchors only
-            for anchor in frame.anchors {
-                guard let plane = anchor as? ARPlaneAnchor else { continue }
-                let ap = plane.transform.columns.3
-                let dist = simd_length(SIMD3<Float>(ap.x - camX, 0, ap.z - camZ))
-                guard dist < 6 else { continue }
-                switch plane.classification {
-                case .floor:
-                    markPlane(plane, as: OccupancyGrid.free, floorY: floorY, headY: headY)
-                default:
-                    markPlane(plane, as: OccupancyGrid.occupied, floorY: floorY, headY: headY)
+            if plane.classification == .floor {
+                markPlaneFloor(plane)
+            } else {
+                let planeY = ap.y
+                // Only mark non-floor planes that are at body-clearance height
+                if planeY > floorY + 0.2, planeY < headY {
+                    markPlaneObstacle(plane)
                 }
             }
         }
 
-        _ = fwdX; _ = fwdZ  // suppress unused warnings — used in pathfinding
+        // ── ARMeshAnchor face classifications (LiDAR only) ───────────────
+        // Use ARKit's face classifications — NOT raw vertex height thresholds.
+        // Floor faces → free. Wall/seat/table/etc. faces at body height → occupied.
+        if isLiDAR {
+            for anchor in frame.anchors {
+                guard let mesh = anchor as? ARMeshAnchor else { continue }
+                let ap = mesh.transform.columns.3
+                let dx = ap.x - camX, dz = ap.z - camZ
+                guard dx * dx + dz * dz < 36 else { continue }
+                markMeshByClassification(mesh, floorY: floorY, headY: headY)
+            }
+
+            // Depth buffer: mark cells with immediate obstacles (< 0.8 m) as occupied.
+            // Uses markObstacle so confirmed floor cells are never overwritten.
+            if let depthMap = frame.smoothedSceneDepth?.depthMap {
+                markDepthOccupancy(depthMap: depthMap, cam: frame.camera,
+                                   floorY: floorY, headY: headY)
+            }
+        }
     }
 
-    /// Mark a grid of sample points within an ARPlaneAnchor's extent.
-    private func markPlane(_ plane: ARPlaneAnchor, as value: UInt8,
-                           floorY: Float, headY: Float) {
-        let ext  = plane.planeExtent
-        let xf   = plane.transform
-        let cx   = xf.columns.3.x, cz = xf.columns.3.z
-        let hw   = ext.width  / 2
-        let hh   = ext.height / 2
-        // Sample a grid inside the plane extent (every 0.25 m)
+    /// Sample the floor plane extent and call markFloor on each cell.
+    private func markPlaneFloor(_ plane: ARPlaneAnchor) {
+        let ext = plane.planeExtent
+        let xf  = plane.transform
+        let hw  = ext.width / 2, hh = ext.height / 2
         var u: Float = -hw
         while u <= hw {
             var v: Float = -hh
             while v <= hh {
-                let wx = xf.columns.0.x * u + xf.columns.2.x * v + cx
-                let wy = xf.columns.0.y * u + xf.columns.2.y * v + xf.columns.3.y
-                let wz = xf.columns.0.z * u + xf.columns.2.z * v + cz
-                // Only mark in body clearance zone
-                if wy > floorY + 0.15, wy < headY {
-                    occupancyGrid.mark(x: wx, z: wz, as: value)
-                } else if value == OccupancyGrid.free, wy <= floorY + 0.15 {
-                    occupancyGrid.mark(x: wx, z: wz, as: OccupancyGrid.free)
-                }
+                let wx = xf.columns.0.x*u + xf.columns.2.x*v + xf.columns.3.x
+                let wz = xf.columns.0.z*u + xf.columns.2.z*v + xf.columns.3.z
+                occupancyGrid.markFloor(x: wx, z: wz)
                 v += OccupancyGrid.cellSize
             }
             u += OccupancyGrid.cellSize
         }
     }
 
-    /// Project close depth samples into the occupancy grid as obstacles.
-    private func markDepthOccupancy(depthMap: CVPixelBuffer, cam: ARCamera) {
+    /// Sample a non-floor plane and call markObstacle on each cell.
+    private func markPlaneObstacle(_ plane: ARPlaneAnchor) {
+        let ext = plane.planeExtent
+        let xf  = plane.transform
+        let hw  = ext.width / 2, hh = ext.height / 2
+        var u: Float = -hw
+        while u <= hw {
+            var v: Float = -hh
+            while v <= hh {
+                let wx = xf.columns.0.x*u + xf.columns.2.x*v + xf.columns.3.x
+                let wz = xf.columns.0.z*u + xf.columns.2.z*v + xf.columns.3.z
+                occupancyGrid.markObstacle(x: wx, z: wz)
+                v += OccupancyGrid.cellSize
+            }
+            u += OccupancyGrid.cellSize
+        }
+    }
+
+    /// Iterate sampled mesh faces and mark by ARKit face classification.
+    /// Floor faces → markFloor (can never be overwritten).
+    /// Obstacle faces at body height → markObstacle.
+    /// Unclassified faces → ignored (don't poison cells).
+    private func markMeshByClassification(_ anchor: ARMeshAnchor,
+                                          floorY: Float, headY: Float) {
+        let geo       = anchor.geometry
+        guard let cls = geo.classification else { return }
+        let faceCount = geo.faces.count
+        guard faceCount > 0 else { return }
+
+        let classPtr = cls.buffer.contents().assumingMemoryBound(to: UInt8.self)
+        let verts    = geo.vertices
+        let vBuf     = verts.buffer.contents()
+        let vStride  = verts.stride
+        let vOffset  = verts.offset
+        let facesBuf = geo.faces.buffer.contents()
+        let idxBytes = geo.faces.bytesPerIndex
+        let xform    = anchor.transform
+        let step     = max(1, faceCount / 500)
+
+        var f = 0
+        while f < faceCount {
+            guard let meshCls = ARMeshClassification(rawValue: Int(classPtr[f])) else {
+                f += step; continue
+            }
+
+            // Get world position of the face's first vertex
+            let baseOff = f * 3 * idxBytes
+            let vi: Int
+            switch idxBytes {
+            case 4:  vi = Int(facesBuf.advanced(by: baseOff).assumingMemoryBound(to: UInt32.self).pointee)
+            case 2:  vi = Int(facesBuf.advanced(by: baseOff).assumingMemoryBound(to: UInt16.self).pointee)
+            default: vi = Int(facesBuf.advanced(by: baseOff).assumingMemoryBound(to: UInt8.self).pointee)
+            }
+
+            let vPtr = vBuf.advanced(by: vOffset + vi * vStride).assumingMemoryBound(to: Float.self)
+            let lx = vPtr[0], ly = vPtr[1], lz = vPtr[2]
+            let wx = xform.columns.0.x*lx + xform.columns.1.x*ly + xform.columns.2.x*lz + xform.columns.3.x
+            let wy = xform.columns.0.y*lx + xform.columns.1.y*ly + xform.columns.2.y*lz + xform.columns.3.y
+            let wz = xform.columns.0.z*lx + xform.columns.1.z*ly + xform.columns.2.z*lz + xform.columns.3.z
+
+            switch meshCls {
+            case .floor:
+                // ARKit says this is floor → always walkable
+                occupancyGrid.markFloor(x: wx, z: wz)
+            case .wall, .ceiling, .seat, .table, .door, .window:
+                // Obstacle — only block the cell if geometry is at body height
+                if wy > floorY + 0.2, wy < headY {
+                    occupancyGrid.markObstacle(x: wx, z: wz)
+                }
+            default:
+                // .none / unclassified — do not mark (avoids poisoning cells)
+                break
+            }
+            f += step
+        }
+    }
+
+    /// Project depth samples < 0.8 m into the grid as obstacles.
+    /// Uses markObstacle so confirmed floor cells are never blocked.
+    private func markDepthOccupancy(depthMap: CVPixelBuffer, cam: ARCamera,
+                                    floorY: Float, headY: Float) {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
-        let w    = CVPixelBufferGetWidth(depthMap)
-        let h    = CVPixelBufferGetHeight(depthMap)
+        let w = CVPixelBufferGetWidth(depthMap), h = CVPixelBufferGetHeight(depthMap)
         guard let base = CVPixelBufferGetBaseAddress(depthMap) else { return }
-        let buf  = base.assumingMemoryBound(to: Float32.self)
-
+        let buf   = base.assumingMemoryBound(to: Float32.self)
         let intr  = cam.intrinsics
         let xform = cam.transform
-        let camX  = xform.columns.3.x
-        let camY  = xform.columns.3.y
-        let camZ  = xform.columns.3.z
-        let floorY = camY - 1.7, headY = camY + 0.3
-        let fx = intr[0][0], fy = intr[1][1]
-        let cx = intr[2][0], cy = intr[2][1]
+        let camX  = xform.columns.3.x, camY = xform.columns.3.y, camZ = xform.columns.3.z
+        let fx = intr[0][0], fy = intr[1][1], cx = intr[2][0], cy = intr[2][1]
 
         var py = 0
         while py < h {
             var px = 0
             while px < w {
                 let depth = buf[py * w + px]
-                // Only interested in close obstacles (< 0.8 m)
                 guard depth > 0, depth < 0.8, depth.isFinite else { px += 16; continue }
-                // Camera-space 3D point
-                let cpX = (Float(px) - cx) / fx * depth
+                let cpX =  (Float(px) - cx) / fx * depth
                 let cpY = -(Float(py) - cy) / fy * depth
                 let cpZ = -depth
-                // World space
                 let wx = xform.columns.0.x*cpX + xform.columns.1.x*cpY + xform.columns.2.x*cpZ + camX
                 let wy = xform.columns.0.y*cpX + xform.columns.1.y*cpY + xform.columns.2.y*cpZ + camY
                 let wz = xform.columns.0.z*cpX + xform.columns.1.z*cpY + xform.columns.2.z*cpZ + camZ
-                if wy > floorY + 0.15, wy < headY {
-                    occupancyGrid.mark(x: wx, z: wz, as: OccupancyGrid.occupied)
+                if wy > floorY + 0.2, wy < headY {
+                    occupancyGrid.markObstacle(x: wx, z: wz)
                 }
                 px += 16
             }

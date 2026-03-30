@@ -281,11 +281,15 @@ struct CameraTabView: View {
                     let color: Color
                     switch value {
                     case OccupancyGrid.free:
-                        color = isLiDAR ? .green : Color(red: 0.4, green: 0.8, blue: 0.4)
+                        // Solid green (LiDAR) or light green (non-LiDAR, lower confidence)
+                        color = isLiDAR ? Color(red: 0.1, green: 0.85, blue: 0.1)
+                                        : Color(red: 0.5, green: 0.85, blue: 0.5)
                     case OccupancyGrid.occupied:
-                        color = .red
+                        // Bright red — confirmed obstacle
+                        color = Color(red: 0.9, green: 0.15, blue: 0.15)
                     default:
-                        color = Color(white: 0.15)
+                        // Medium gray — no data yet (clearly different from both)
+                        color = Color(white: 0.32)
                     }
                     let rect = CGRect(x: CGFloat(col) * cellPt,
                                       y: CGFloat(row) * cellPt,

@@ -23,6 +23,9 @@ struct OccupancyGrid {
 
     // MARK: - Storage
     private(set) var cells: [UInt8]
+    /// True for cells confirmed as floor by ARKit classification — these can never
+    /// be overwritten as occupied by the obstacle/depth logic.
+    private(set) var isFloor: [Bool]
     private(set) var originX: Float = 0   // ARKit world X of grid centre (= camera X)
     private(set) var originZ: Float = 0   // ARKit world Z of grid centre (= camera Z)
 
@@ -38,15 +41,28 @@ struct OccupancyGrid {
 
     // MARK: - Init
     init() {
-        cells = [UInt8](repeating: OccupancyGrid.unknown,
-                        count: OccupancyGrid.side * OccupancyGrid.side)
+        let n = OccupancyGrid.side * OccupancyGrid.side
+        cells   = [UInt8](repeating: OccupancyGrid.unknown, count: n)
+        isFloor = [Bool](repeating: false,                  count: n)
     }
 
     // MARK: - Reset (call at the start of every analysis frame)
     mutating func reset(cameraX: Float, cameraZ: Float) {
         originX = cameraX
         originZ = cameraZ
-        for i in cells.indices { cells[i] = OccupancyGrid.unknown }
+        for i in cells.indices { cells[i] = OccupancyGrid.unknown; isFloor[i] = false }
+    }
+
+    // MARK: - Seeding
+
+    /// Mark the 9 cells around the user as floor.
+    /// The user is standing somewhere — that somewhere is walkable by definition.
+    mutating func seedUserPosition() {
+        for dr in -1...1 { for dc in -1...1 {
+            let x = originX + Float(dc) * OccupancyGrid.cellSize
+            let z = originZ + Float(dr) * OccupancyGrid.cellSize
+            markFloor(x: x, z: z)
+        }}
     }
 
     // MARK: - Coordinate helpers
@@ -68,11 +84,31 @@ struct OccupancyGrid {
 
     // MARK: - Mark
 
-    /// Mark a world-space XZ position. Occupied cells are never downgraded to free.
+    /// Mark a world-space XZ position as confirmed floor (ARKit classification).
+    /// Floor cells can never be overwritten as occupied.
+    mutating func markFloor(x: Float, z: Float) {
+        guard let (r, c) = worldToCell(x: x, z: z) else { return }
+        let idx = r * OccupancyGrid.side + c
+        cells[idx]   = OccupancyGrid.free
+        isFloor[idx] = true
+    }
+
+    /// Mark a world-space XZ position as occupied (obstacle/depth).
+    /// Has no effect on confirmed floor cells.
+    mutating func markObstacle(x: Float, z: Float) {
+        guard let (r, c) = worldToCell(x: x, z: z) else { return }
+        let idx = r * OccupancyGrid.side + c
+        guard !isFloor[idx] else { return }   // floor wins — never block it
+        cells[idx] = OccupancyGrid.occupied
+    }
+
+    /// Generic mark — used only for unknown→free transitions where ARKit
+    /// classification is unavailable. Never overwrites confirmed floor or occupied.
     mutating func mark(x: Float, z: Float, as value: UInt8) {
         guard let (r, c) = worldToCell(x: x, z: z) else { return }
         let idx = r * OccupancyGrid.side + c
-        if value == OccupancyGrid.free, cells[idx] == OccupancyGrid.occupied { return }
+        if value == OccupancyGrid.free,  cells[idx] == OccupancyGrid.occupied { return }
+        if value == OccupancyGrid.occupied, isFloor[idx]                       { return }
         cells[idx] = value
     }
 
